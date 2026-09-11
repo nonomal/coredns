@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -80,8 +82,45 @@ func TestCustomHTTPRequestValidator(t *testing.T) {
 	}
 }
 
+func TestServerHTTPSRejectsUpdate(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		t.Run(method, func(t *testing.T) {
+			handler := new(updateResponsePlugin)
+			config := testConfig("https", handler)
+			config.TLSConfig = &tls.Config{}
+
+			server, err := NewServerHTTPS("127.0.0.1:443", []*Config{config})
+			if err != nil {
+				t.Fatalf("NewServerHTTPS() failed: %v", err)
+			}
+
+			wire := mustPackRFC2136Update(t)
+			target := "/dns-query"
+			var body io.Reader
+			if method == http.MethodGet {
+				target += "?dns=" + base64.RawURLEncoding.EncodeToString(wire)
+			} else {
+				body = bytes.NewReader(wire)
+			}
+			req := httptest.NewRequest(method, target, body)
+			req.RemoteAddr = "127.0.0.1:12345"
+			recorder := httptest.NewRecorder()
+
+			server.ServeHTTP(recorder, req)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("ServeHTTP() status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			if handler.called.Load() {
+				t.Fatal("RFC 2136 UPDATE reached the plugin chain")
+			}
+		})
+	}
+}
+
 func TestNewServerHTTPSWithCustomLimits(t *testing.T) {
 	maxConnections := 100
+	maxStreams := 100
 	c := Config{
 		Zone:                "example.com.",
 		Transport:           "https",
@@ -89,6 +128,7 @@ func TestNewServerHTTPSWithCustomLimits(t *testing.T) {
 		ListenHosts:         []string{"127.0.0.1"},
 		Port:                "443",
 		MaxHTTPSConnections: &maxConnections,
+		MaxHTTPSStreams:     &maxStreams,
 	}
 
 	server, err := NewServerHTTPS("127.0.0.1:443", []*Config{&c})
@@ -98,6 +138,12 @@ func TestNewServerHTTPSWithCustomLimits(t *testing.T) {
 
 	if server.maxConnections != maxConnections {
 		t.Errorf("Expected maxConnections = %d, got %d", maxConnections, server.maxConnections)
+	}
+	if server.httpsServer.HTTP2 == nil {
+		t.Fatal("Expected HTTP/2 configuration")
+	}
+	if got := server.httpsServer.HTTP2.MaxConcurrentStreams; got != maxStreams {
+		t.Errorf("Expected MaxConcurrentStreams = %d, got %d", maxStreams, got)
 	}
 }
 
@@ -138,6 +184,122 @@ func TestNewServerHTTPSZeroLimits(t *testing.T) {
 
 	if server.maxConnections != 0 {
 		t.Errorf("Expected maxConnections = 0, got %d", server.maxConnections)
+	}
+}
+
+func TestNewServerHTTPSZeroStreams(t *testing.T) {
+	// max_streams 0 means "use the underlying HTTP/2 transport default": we must NOT
+	// explicitly configure HTTP/2 (so Go's built-in default of 250 applies).
+	zero := 0
+	c := Config{
+		Zone:            "example.com.",
+		Transport:       "https",
+		TLSConfig:       &tls.Config{},
+		ListenHosts:     []string{"127.0.0.1"},
+		Port:            "443",
+		MaxHTTPSStreams: &zero,
+	}
+
+	server, err := NewServerHTTPS("127.0.0.1:443", []*Config{&c})
+	if err != nil {
+		t.Fatalf("NewServerHTTPS() with zero streams failed: %v", err)
+	}
+
+	if server.httpsServer.HTTP2 != nil {
+		t.Errorf("Expected no explicit HTTP/2 configuration for max_streams 0 (transport default), got MaxConcurrentStreams = %d",
+			server.httpsServer.HTTP2.MaxConcurrentStreams)
+	}
+}
+
+func TestNewServerHTTPSDefaultStreams(t *testing.T) {
+	// max_streams omitted means the CoreDNS default (DefaultHTTPSMaxStreams) is applied.
+	c := Config{
+		Zone:        "example.com.",
+		Transport:   "https",
+		TLSConfig:   &tls.Config{},
+		ListenHosts: []string{"127.0.0.1"},
+		Port:        "443",
+	}
+
+	server, err := NewServerHTTPS("127.0.0.1:443", []*Config{&c})
+	if err != nil {
+		t.Fatalf("NewServerHTTPS() failed: %v", err)
+	}
+
+	if server.httpsServer.HTTP2 == nil {
+		t.Fatal("Expected HTTP/2 configuration with the default max streams")
+	}
+	if got := server.httpsServer.HTTP2.MaxConcurrentStreams; got != DefaultHTTPSMaxStreams {
+		t.Errorf("Expected default MaxConcurrentStreams = %d, got %d", DefaultHTTPSMaxStreams, got)
+	}
+}
+
+func TestNewServerHTTPSStreamsAcrossGroup(t *testing.T) {
+	// Blocks sharing a listener are passed as one group and share one HTTP/2
+	// connection, so the limit must resolve to a single value regardless of
+	// which member carries it, and conflicting values must be rejected.
+	intPtr := func(v int) *int { return &v }
+	streamsConfig := func(zone string, v *int) *Config {
+		return &Config{
+			Zone:            zone,
+			Transport:       "https",
+			TLSConfig:       &tls.Config{},
+			ListenHosts:     []string{"127.0.0.1"},
+			Port:            "443",
+			MaxHTTPSStreams: v,
+		}
+	}
+
+	tests := []struct {
+		name      string
+		group     []*Config
+		shouldErr bool
+		want      int
+	}{
+		{
+			name:  "set on first member",
+			group: []*Config{streamsConfig("first.example.", intPtr(7)), streamsConfig("second.example.", nil)},
+			want:  7,
+		},
+		{
+			name:  "set on second member",
+			group: []*Config{streamsConfig("first.example.", nil), streamsConfig("second.example.", intPtr(7))},
+			want:  7,
+		},
+		{
+			name:  "omitted on all members",
+			group: []*Config{streamsConfig("first.example.", nil), streamsConfig("second.example.", nil)},
+			want:  DefaultHTTPSMaxStreams,
+		},
+		{
+			name:      "conflicting values",
+			group:     []*Config{streamsConfig("first.example.", intPtr(7)), streamsConfig("second.example.", intPtr(9))},
+			shouldErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server, err := NewServerHTTPS("127.0.0.1:443", tc.group)
+			if tc.shouldErr {
+				if err == nil {
+					t.Fatal("Expected error for conflicting max_streams values, got nil")
+				}
+				if !strings.Contains(err.Error(), "conflicting max_streams") {
+					t.Errorf("Expected a conflicting max_streams error, got: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewServerHTTPS() failed: %v", err)
+			}
+			if server.httpsServer.HTTP2 == nil {
+				t.Fatal("Expected HTTP/2 configuration")
+			}
+			if got := server.httpsServer.HTTP2.MaxConcurrentStreams; got != tc.want {
+				t.Errorf("Expected MaxConcurrentStreams = %d, got %d", tc.want, got)
+			}
+		})
 	}
 }
 
@@ -196,7 +358,7 @@ func TestDoHWriterLaddrFromConnContext(t *testing.T) {
 	ppDst := &net.TCPAddr{IP: net.ParseIP("10.0.0.1"), Port: 443}
 
 	r := httptest.NewRequest(http.MethodPost, "/dns-query", io.NopCloser(bytes.NewReader(buf)))
-	ctx := context.WithValue(r.Context(), connAddrKey{}, ppDst)
+	ctx := context.WithValue(r.Context(), http.LocalAddrContextKey, ppDst)
 	r = r.WithContext(ctx)
 	w := httptest.NewRecorder()
 
@@ -230,7 +392,7 @@ func TestDoHWriterLaddrFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// No connAddrKey in context; should fall back to s.listenAddr.
+	// No LocalAddrContextKey in context; should fall back to s.listenAddr.
 	r := httptest.NewRequest(http.MethodPost, "/dns-query", io.NopCloser(bytes.NewReader(buf)))
 	w := httptest.NewRecorder()
 
@@ -581,5 +743,46 @@ func TestDoHWriterTsigStatusReturnsStoredStatus(t *testing.T) {
 	dw := &DoHWriter{tsigStatus: dns.ErrSecret}
 	if dw.TsigStatus() != dns.ErrSecret {
 		t.Fatal("expected TsigStatus to return stored tsigStatus")
+	}
+}
+
+type errReader struct{}
+
+const leakyBodyReadError = "read tcp 10.0.0.1:5443->10.0.0.2:48418: i/o timeout"
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New(leakyBodyReadError) }
+
+func TestServeHTTPDoesNotLeakBodyReadError(t *testing.T) {
+	c := Config{
+		Zone:        "example.com.",
+		Transport:   "https",
+		TLSConfig:   &tls.Config{},
+		ListenHosts: []string{"127.0.0.1"},
+		Port:        "443",
+	}
+	s, err := NewServerHTTPS("127.0.0.1:443", []*Config{&c})
+	if err != nil {
+		t.Fatal("could not create HTTPS server:", err)
+	}
+
+	r := httptest.NewRequest(http.MethodPost, "/dns-query", errReader{})
+	r.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+
+	s.ServeHTTP(w, r)
+
+	res := w.Result()
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, res.StatusCode)
+	}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(body)); got != "invalid request" {
+		t.Fatalf("expected sanitized body %q, got %q", "invalid request", got)
 	}
 }

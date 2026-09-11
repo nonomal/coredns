@@ -27,6 +27,10 @@ import (
 const (
 	// DefaultHTTPSMaxConnections is the default maximum number of concurrent connections.
 	DefaultHTTPSMaxConnections = 200
+
+	// DefaultHTTPSMaxStreams is the default maximum number of concurrent HTTP/2 streams
+	// per connection, used when max_streams is not specified.
+	DefaultHTTPSMaxStreams = 250
 )
 
 // ServerHTTPS represents an instance of a DNS-over-HTTPS server.
@@ -51,9 +55,6 @@ func (l *loggerAdapter) Write(p []byte) (n int, err error) {
 // HTTPRequestKey is the context key for the HTTP request when processing DNS-over-HTTPS.
 // Plugins can access the original HTTP request to retrieve headers, client IP, and metadata.
 type HTTPRequestKey struct{}
-
-// connAddrKey is the context key for the per-connection local address set by ConnContext.
-type connAddrKey struct{}
 
 // NewServerHTTPS returns a new CoreDNS HTTPS server and compiles all plugins in to it.
 func NewServerHTTPS(addr string, group []*Config) (*ServerHTTPS, error) {
@@ -93,9 +94,31 @@ func NewServerHTTPS(addr string, group []*Config) (*ServerHTTPS, error) {
 		WriteTimeout: s.WriteTimeout,
 		IdleTimeout:  s.IdleTimeout,
 		ErrorLog:     stdlog.New(&loggerAdapter{}, "", 0),
-		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			return context.WithValue(ctx, connAddrKey{}, c.LocalAddr())
-		},
+	}
+	// max_streams limits the number of concurrent HTTP/2 streams per connection. When unset,
+	// DefaultHTTPSMaxStreams is applied; a value of 0 leaves the underlying HTTP/2 transport
+	// default in place; a positive value sets the limit explicitly. The chosen value is
+	// advertised in the server's SETTINGS frame. Resolve across the whole group since blocks
+	// sharing a listener share one HTTP/2 server; conflicting explicit values are rejected.
+	maxStreams := DefaultHTTPSMaxStreams
+	var resolved *int
+	for _, conf := range group {
+		if conf == nil || conf.MaxHTTPSStreams == nil {
+			continue
+		}
+		if resolved != nil && *resolved != *conf.MaxHTTPSStreams {
+			return nil, fmt.Errorf("conflicting max_streams values for shared HTTPS listener %s: %d and %d",
+				addr, *resolved, *conf.MaxHTTPSStreams)
+		}
+		resolved = conf.MaxHTTPSStreams
+	}
+	if resolved != nil {
+		maxStreams = *resolved
+	}
+	if maxStreams > 0 {
+		srv.HTTP2 = &http.HTTP2Config{
+			MaxConcurrentStreams: maxStreams,
+		}
 	}
 	maxConnections := DefaultHTTPSMaxConnections
 	if len(group) > 0 && group[0] != nil && group[0].MaxHTTPSConnections != nil {
@@ -176,9 +199,9 @@ func (s *ServerHTTPS) Stop() error {
 	return nil
 }
 
-// localAddr returns the per-connection local address from context, or s.listenAddr as fallback.
+// localAddr returns the per-connection local address, or s.listenAddr as fallback.
 func (s *ServerHTTPS) localAddr(r *http.Request) net.Addr {
-	if addr, ok := r.Context().Value(connAddrKey{}).(net.Addr); ok {
+	if addr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
 		return addr
 	}
 	return s.listenAddr
@@ -195,7 +218,8 @@ func (s *ServerHTTPS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	msg, raw, err := doh.RequestToMsgWire(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		clog.Debugf("DoH request could not be parsed: %v", err)
+		http.Error(w, "invalid request", http.StatusBadRequest)
 		s.countResponse(http.StatusBadRequest)
 		return
 	}
@@ -242,7 +266,7 @@ func (s *ServerHTTPS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	buf, _ := dw.Msg.Pack()
 
 	mt, _ := response.Typify(dw.Msg, time.Now().UTC())
-	age := dnsutil.MinimalTTL(dw.Msg, mt)
+	age := dnsutil.MinimalTTLWithMaximum(dw.Msg, mt, dnsutil.MaximumDefaultTTL)
 
 	w.Header().Set("Content-Type", doh.MimeType)
 	w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%d", uint32(age.Seconds())))
